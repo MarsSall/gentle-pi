@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from "node:child_process";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -77,20 +77,109 @@ type ExecFileFunction = (
 ) => ExecFileResult;
 
 interface CodeGraphRunnerDependencies {
+	platform?: NodeJS.Platform;
+	env?: NodeJS.ProcessEnv;
 	execFile?: ExecFileFunction;
+}
+
+function pathEnvironment(env: NodeJS.ProcessEnv): string {
+	const key = Object.keys(env).find((name) => name.toLowerCase() === "path");
+	return key === undefined ? "" : (env[key] ?? "");
+}
+
+function isInside(root: string, candidate: string): boolean {
+	const pathFromRoot = relative(root, candidate);
+	return (
+		pathFromRoot === "" ||
+		(!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))
+	);
+}
+
+function regularRealFile(path: string, root?: string): string {
+	const link = lstatSync(path);
+	if (link.isSymbolicLink() || !link.isFile())
+		throw new Error(`${path} is not a regular file.`);
+	const resolved = realpathSync(path);
+	if (root !== undefined && !isInside(root, resolved))
+		throw new Error(`${path} escapes its package root.`);
+	return resolved;
+}
+
+function packageEntryFromPrefix(prefix: string): string | undefined {
+	try {
+		const shimNames = ["codegraph.cmd", "codegraph"];
+		if (
+			!shimNames.some((name) => {
+				try {
+					regularRealFile(join(prefix, name));
+					return true;
+				} catch {
+					return false;
+				}
+			})
+		)
+			return undefined;
+
+		const packageRoot = realpathSync(
+			join(prefix, "node_modules", "@colbymchenry", "codegraph"),
+		);
+		if (!lstatSync(packageRoot).isDirectory()) return undefined;
+		const packageJson = regularRealFile(
+			join(packageRoot, "package.json"),
+			packageRoot,
+		);
+		const metadata = JSON.parse(readFileSync(packageJson, "utf8")) as {
+			bin?: unknown;
+		};
+		let bin: unknown;
+		if (typeof metadata.bin === "string") {
+			bin = metadata.bin;
+		} else if (typeof metadata.bin === "object" && metadata.bin !== null) {
+			bin = (metadata.bin as Record<string, unknown>).codegraph;
+		}
+		if (typeof bin !== "string" || bin.length === 0 || isAbsolute(bin))
+			return undefined;
+		return regularRealFile(join(packageRoot, bin), packageRoot);
+	} catch {
+		return undefined;
+	}
+}
+
+function resolveWindowsCodeGraphEntry(env: NodeJS.ProcessEnv): string {
+	for (const rawEntry of pathEnvironment(env).split(";")) {
+		const prefix = rawEntry.trim().replace(/^"|"$/g, "");
+		if (prefix.length === 0) continue;
+		const entry = packageEntryFromPrefix(prefix);
+		if (entry !== undefined) return entry;
+	}
+	const error = Object.assign(
+		new Error(
+			"No safe CodeGraph npm package entry could be resolved from PATH.",
+		),
+		{ code: "ENOENT" },
+	);
+	throw error;
 }
 
 export function createCodeGraphRunner(
 	dependencies: CodeGraphRunnerDependencies = {},
 ): CodeGraphRunner {
+	const platform = dependencies.platform ?? process.platform;
+	const env = dependencies.env ?? process.env;
 	const execute =
 		dependencies.execFile ?? (execFileAsync as unknown as ExecFileFunction);
-	return async (args, options) =>
-		execute("codegraph", [...args], {
+	// Keep this callback async so resolver errors preserve the runner's rejected-Promise contract.
+	return async (args, options) => {
+		const commandArgs = [...args];
+		const file = platform === "win32" ? process.execPath : "codegraph";
+		if (platform === "win32")
+			commandArgs.unshift(resolveWindowsCodeGraphEntry(env));
+		return execute(file, commandArgs, {
 			cwd: options.cwd,
 			signal: options.signal,
 			maxBuffer: options.maxBuffer,
 		});
+	};
 }
 
 function resolveWorkspaceCwd(cwd: string): string {

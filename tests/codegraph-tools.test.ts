@@ -11,6 +11,24 @@ import codeGraphTools, {
 	type CodeGraphRunner,
 } from "../extensions/codegraph-tools.ts";
 
+function fakeGlobalPackage(t: test.TestContext): {
+	prefix: string;
+	entry: string;
+} {
+	const prefix = mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-global-"));
+	t.after(() => rmSync(prefix, { recursive: true, force: true }));
+	const root = join(prefix, "node_modules", "@colbymchenry", "codegraph");
+	const entry = join(root, "dist", "cli.js");
+	mkdirSync(join(root, "dist"), { recursive: true });
+	writeFileSync(join(prefix, "codegraph.cmd"), "npm shim");
+	writeFileSync(
+		join(root, "package.json"),
+		JSON.stringify({ bin: { codegraph: "dist/cli.js" } }),
+	);
+	writeFileSync(entry, "console.log('codegraph')");
+	return { prefix, entry };
+}
+
 function workspace(t: test.TestContext): string {
 	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-")));
 	execFileSync("git", ["init", "-b", "main"], { cwd, stdio: "ignore" });
@@ -18,10 +36,49 @@ function workspace(t: test.TestContext): string {
 	return cwd;
 }
 
+test("Windows runner resolves an npm global package from PATH without losing argument boundaries", async (t) => {
+	const { prefix, entry } = fakeGlobalPackage(t);
+	const hostile = "symbol & whoami | echo hacked > owned $(calc)";
+	const signal = new AbortController().signal;
+	const calls: Array<{
+		file: string;
+		args: string[];
+		options: Record<string, unknown>;
+	}> = [];
+	const runner = createCodeGraphRunner({
+		platform: "win32",
+		env: { PATH: prefix },
+		execFile: async (file, args, options) => {
+			calls.push({ file, args, options });
+			return { stdout: "safe", stderr: "" };
+		},
+	});
+
+	const result = await runner(["query", "--", hostile], {
+		cwd: prefix,
+		signal,
+		maxBuffer: 1234,
+	});
+
+	assert.deepEqual(result, { stdout: "safe", stderr: "" });
+	assert.deepEqual(calls, [
+		{
+			file: process.execPath,
+			args: [entry, "query", "--", hostile],
+			options: { cwd: prefix, signal, maxBuffer: 1234 },
+		},
+	]);
+});
+
 test("runner preserves direct shell-free Unix execution", async () => {
 	const signal = new AbortController().signal;
-	const calls: Array<{ file: string; args: string[]; options: Record<string, unknown> }> = [];
+	const calls: Array<{
+		file: string;
+		args: string[];
+		options: Record<string, unknown>;
+	}> = [];
 	const runner = createCodeGraphRunner({
+		platform: "linux",
 		execFile: async (file, args, options) => {
 			calls.push({ file, args, options });
 			return { stdout: "ok", stderr: "" };
@@ -29,10 +86,86 @@ test("runner preserves direct shell-free Unix execution", async () => {
 	});
 
 	await runner(["query", "--", "a;b"], { cwd: "/repo", signal, maxBuffer: 99 });
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0]?.args[2], "a;b");
 	assert.deepEqual(calls, [
-		{ file: "codegraph", args: ["query", "--", "a;b"], options: { cwd: "/repo", signal, maxBuffer: 99 } },
+		{
+			file: "codegraph",
+			args: ["query", "--", "a;b"],
+			options: { cwd: "/repo", signal, maxBuffer: 99 },
+		},
 	]);
 	assert.equal(calls[0]?.options.signal, signal);
+});
+
+test("Windows runner reports unavailable when no safe npm package can be resolved", async (t) => {
+	const empty = mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-empty-"));
+	t.after(() => rmSync(empty, { recursive: true, force: true }));
+	let calls = 0;
+	const runner = createCodeGraphRunner({
+		platform: "win32",
+		env: { PATH: empty },
+		execFile: async () => {
+			calls += 1;
+			return { stdout: "unexpected", stderr: "" };
+		},
+	});
+
+	await assert.rejects(
+		() => runner([], { cwd: empty, maxBuffer: 1 }),
+		(error: NodeJS.ErrnoException) => {
+			assert.equal(error.code, "ENOENT");
+			assert.match(error.message, /safe CodeGraph npm package entry/i);
+			return true;
+		},
+	);
+	assert.equal(calls, 0);
+});
+
+test("Windows runner rejects malformed metadata and package-bin escapes", async (t) => {
+	for (const bin of [undefined, "../outside.js"] as const) {
+		const { prefix } = fakeGlobalPackage(t);
+		const root = join(prefix, "node_modules", "@colbymchenry", "codegraph");
+		writeFileSync(
+			join(root, "package.json"),
+			bin === undefined ? "{" : JSON.stringify({ bin }),
+		);
+		writeFileSync(
+			join(prefix, "node_modules", "@colbymchenry", "outside.js"),
+			"outside",
+		);
+		const runner = createCodeGraphRunner({
+			platform: "win32",
+			env: { PATH: prefix },
+			execFile: async () => ({ stdout: "unexpected", stderr: "" }),
+		});
+		await assert.rejects(
+			() => runner([], { cwd: prefix, maxBuffer: 1 }),
+			(error: NodeJS.ErrnoException) => error.code === "ENOENT",
+		);
+	}
+});
+
+test("Windows runner rejects a symlinked package bin that escapes its package root", async (t) => {
+	const { prefix, entry } = fakeGlobalPackage(t);
+	const outside = join(prefix, "outside.js");
+	writeFileSync(outside, "outside");
+	rmSync(entry);
+	try {
+		symlinkSync(outside, entry, "file");
+	} catch (error: unknown) {
+		t.skip(`symlinks unavailable: ${String(error)}`);
+		return;
+	}
+	const runner = createCodeGraphRunner({
+		platform: "win32",
+		env: { PATH: prefix },
+		execFile: async () => ({ stdout: "unexpected", stderr: "" }),
+	});
+	await assert.rejects(
+		() => runner([], { cwd: prefix, maxBuffer: 1 }),
+		(error: NodeJS.ErrnoException) => error.code === "ENOENT",
+	);
 });
 
 test("CodeGraph tool rejects non-project, nested-project, HOME, and temporary workspaces before init", async (t) => {
